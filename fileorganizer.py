@@ -16,6 +16,9 @@ import logging
 # --- Delay before organizing (in seconds) ---
 ORGANIZE_DELAY = 600  # 10 minutes
 
+# Partial/temp download extensions — never organize these
+SKIP_EXTS = {'crdownload', 'tmp', 'downloading', 'part~'}
+
 # Configuration handler
 class Config:
     def __init__(self):
@@ -62,12 +65,13 @@ class Config:
 
 # File organization logic
 class FileOrganizer:
+    COMPRESSED_EXTS = {'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst'}
+
+    # Directories created by the organizer that fresh_organize should not recurse into
+    SKIP_DIRS = {'Open Archives', 'Archives W. Compressed'}
+
     # Nested structure: category → sub-type → [extensions]
     # Flat entries (list value) have no sub-type folder.
-    #
-    # Final folder path layout:
-    #   <monitor_dir>/<Category>/<Sub-type>/<Year>/<Month>/<file>   (nested)
-    #   <monitor_dir>/<Category>/<Year>/<Month>/<file>              (flat)
     CATEGORIES = {
         'Images': {
             'Photos':   ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tiff', 'raw', 'heic', 'heif'],
@@ -127,11 +131,12 @@ class FileOrganizer:
             'Libraries': ['dll', 'so', 'dylib'],
             'Compiled':  ['pyd', 'pyo', 'pyc', 'bin'],
         },
-        'Others': [],   # catch-all — no sub-type, no date folder
+        'Others': [],   # catch-all — no sub-type
     }
 
     def __init__(self, base_path):
         self.base_path = base_path
+        self._lock = threading.Lock()  # guards paired archive moves
 
     def get_category(self, filename):
         """Return (category, sub_category) or (category, None) for flat entries."""
@@ -147,18 +152,89 @@ class FileOrganizer:
         return ('Others', None)
 
     def _dest_dir(self, category, sub_category):
-        """Build the full destination directory path by format only (no year/month)."""
+        """Build the full destination directory path by format only."""
         if category == 'Others':
             return os.path.join(self.base_path, 'Others')
-
         if sub_category:
             return os.path.join(self.base_path, category, sub_category)
         else:
             return os.path.join(self.base_path, category)
 
+    def _unique_dest(self, parent, name):
+        """Return a collision-free path for name inside parent."""
+        dest = os.path.join(parent, name)
+        if not os.path.exists(dest):
+            return dest
+        base, ext = os.path.splitext(name)
+        counter = 1
+        while True:
+            candidate = os.path.join(parent, f"{base} ({counter}){ext}")
+            if not os.path.exists(candidate):
+                return candidate
+            counter += 1
+
+    def _find_paired_archive(self, parent_dir, dirname):
+        """Return the path of a compressed file matching dirname, or None."""
+        for ext in self.COMPRESSED_EXTS:
+            candidate = os.path.join(parent_dir, f"{dirname}.{ext}")
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    # ------------------------------------------------------------------
+    # Directory handling
+    # ------------------------------------------------------------------
+
+    def organize_item(self, path):
+        """Unified entry point — routes to directory or file handler."""
+        if not os.path.exists(path):
+            return
+        if os.path.isdir(path):
+            self._organize_dir(path)
+        else:
+            self.organize_file(path)
+
+    def _organize_dir(self, dir_path):
+        """Move a directory to Open Archives or Archives W. Compressed."""
+        with self._lock:
+            if not os.path.exists(dir_path):
+                return
+            dirname = os.path.basename(dir_path)
+            parent  = os.path.dirname(dir_path)
+            paired  = self._find_paired_archive(parent, dirname)
+
+            if paired and os.path.exists(paired):
+                dest_parent = os.path.join(self.base_path, 'Archives W. Compressed')
+                os.makedirs(dest_parent, exist_ok=True)
+                dest = self._unique_dest(dest_parent, dirname)
+                shutil.move(dir_path, dest)
+                shutil.move(paired, os.path.join(dest, os.path.basename(paired)))
+                logging.info(
+                    f"Paired '{dirname}' + '{os.path.basename(paired)}'"
+                    f" → Archives W. Compressed"
+                )
+            else:
+                dest_parent = os.path.join(self.base_path, 'Open Archives')
+                os.makedirs(dest_parent, exist_ok=True)
+                dest = self._unique_dest(dest_parent, dirname)
+                shutil.move(dir_path, dest)
+                logging.info(f"'{dirname}' → Open Archives")
+
+    # ------------------------------------------------------------------
+    # File handling
+    # ------------------------------------------------------------------
+
     def organize_file(self, file_path):
         if os.path.isdir(file_path):
+            self._organize_dir(file_path)
             return
+
+        ext = file_path.rsplit('.', 1)[-1].lower() if '.' in file_path else ''
+
+        # Skip partial/temp downloads completely
+        if ext in SKIP_EXTS:
+            return
+
         # Wait for the file to be accessible (not still being written)
         while True:
             try:
@@ -171,11 +247,27 @@ class FileOrganizer:
         filename = os.path.basename(file_path)
         self.wait_for_download_completion(file_path)
 
+        if not os.path.exists(file_path):
+            return
+
+        # If this is a compressed file and a matching directory exists,
+        # let _organize_dir handle both together
+        if ext in self.COMPRESSED_EXTS:
+            stem = filename[:-(len(ext) + 1)]
+            candidate_dir = os.path.join(os.path.dirname(file_path), stem)
+            if os.path.isdir(candidate_dir):
+                self._organize_dir(candidate_dir)
+                return
+
         category, sub_category = self.get_category(filename)
-        dest_dir = self._dest_dir(category, sub_category)
-        os.makedirs(dest_dir, exist_ok=True)
+        dest_dir  = self._dest_dir(category, sub_category)
         dest_path = os.path.join(dest_dir, filename)
 
+        # Already in the right place — nothing to do
+        if os.path.abspath(os.path.dirname(file_path)) == os.path.abspath(dest_dir):
+            return
+
+        os.makedirs(dest_dir, exist_ok=True)
         label = f"{category}/{sub_category}" if sub_category else category
 
         if not os.path.exists(dest_path):
@@ -215,6 +307,47 @@ class FileOrganizer:
                     break
             time.sleep(check_interval)
 
+    # ------------------------------------------------------------------
+    # Fresh / recursive organize
+    # ------------------------------------------------------------------
+
+    def fresh_organize(self, root_dir):
+        """Recursively organize all files and dirs under root_dir.
+
+        - Skips Open Archives and Archives W. Compressed (to avoid a mess).
+        - Skips hidden files/dirs (names starting with '.').
+        - Recurses into known category folders; moves unknown dirs to
+          Open Archives or Archives W. Compressed.
+        - Files already in the correct folder are left untouched.
+        """
+        try:
+            entries = list(os.scandir(root_dir))
+        except PermissionError:
+            return
+
+        # Organize loose files at this level first
+        for entry in entries:
+            if entry.is_file(follow_symlinks=False) and not entry.name.startswith('.'):
+                self.organize_file(entry.path)
+
+        # Then handle subdirectories
+        for entry in entries:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if entry.name.startswith('.'):
+                continue
+            if entry.name in self.SKIP_DIRS:
+                continue
+            if not os.path.exists(entry.path):
+                continue  # already moved (e.g. paired archive handled it)
+
+            if entry.name in self.CATEGORIES:
+                # Known category folder — recurse into it, don't move it
+                self.fresh_organize(entry.path)
+            else:
+                # Unknown directory — treat as Open Archive / Archives W. Compressed
+                self._organize_dir(entry.path)
+
 
 # File system event handler — with 10-minute delay
 class DownloadHandler(FileSystemEventHandler):
@@ -223,9 +356,9 @@ class DownloadHandler(FileSystemEventHandler):
         self.organizer = organizer
         self.retries = 5
         self.delay = 2
-        self._pending_timers = {}   # file_path -> threading.Timer
+        self._pending_timers = {}   # path -> threading.Timer
         self._lock = threading.Lock()
-        self.on_pending_change = on_pending_change  # optional callback for UI updates
+        self.on_pending_change = on_pending_change
 
     @property
     def pending_count(self):
@@ -233,13 +366,12 @@ class DownloadHandler(FileSystemEventHandler):
             return len(self._pending_timers)
 
     def on_created(self, event):
-        if not event.is_directory:
-            self._schedule(event.src_path)
+        # Handle both new files and new directories
+        self._schedule(event.src_path)
 
     def _schedule(self, path):
-        """Schedule a file to be organized after ORGANIZE_DELAY seconds."""
+        """Schedule a path (file or dir) to be organized after ORGANIZE_DELAY seconds."""
         with self._lock:
-            # Cancel any existing timer for this path (e.g. file replaced)
             if path in self._pending_timers:
                 self._pending_timers[path].cancel()
 
@@ -255,7 +387,7 @@ class DownloadHandler(FileSystemEventHandler):
             self.on_pending_change(self.pending_count)
 
     def _run(self, path):
-        """Called after the delay; actually organizes the file."""
+        """Called after the delay; actually organizes the item."""
         with self._lock:
             self._pending_timers.pop(path, None)
 
@@ -263,17 +395,20 @@ class DownloadHandler(FileSystemEventHandler):
             self.on_pending_change(self.pending_count)
 
         if not os.path.exists(path):
-            logging.info(f"File no longer exists, skipping: '{path}'")
+            logging.info(f"Item no longer exists, skipping: '{path}'")
             return
 
-        self.handle_file(path)
+        self.handle_item(path)
 
-    def handle_file(self, path):
+    def handle_item(self, path):
+        if os.path.isdir(path):
+            self.organizer.organize_item(path)
+            return
         for _ in range(self.retries):
             try:
                 with open(path, 'rb'):
                     pass
-                self.organizer.organize_file(path)
+                self.organizer.organize_item(path)
                 break
             except PermissionError:
                 time.sleep(self.delay)
@@ -297,18 +432,16 @@ class DownloadOrganizerApp:
         self.handler = None
         self.tray_icon = None
         self.setup_gui()
-        # Auto-start monitoring immediately if the directory exists
         self._auto_start()
 
     def setup_gui(self):
         self.root = tk.Tk()
         self.root.title("Download Organizer")
-        self.root.geometry("400x230")
+        self.root.geometry("400x320")
 
-        # Intercept window close → minimize to tray instead of quitting
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
 
-        # Directory selection
+        # --- Monitor directory ---
         self.dir_var = tk.StringVar(value=self.config.data['monitor_dir'])
         tk.Label(self.root, text="Monitor Directory:").pack(pady=5)
         dir_frame = tk.Frame(self.root)
@@ -316,36 +449,51 @@ class DownloadOrganizerApp:
         tk.Entry(dir_frame, textvariable=self.dir_var, width=35).pack(side=tk.LEFT, padx=5)
         tk.Button(dir_frame, text="Browse", command=self.choose_directory).pack(side=tk.LEFT)
 
-        # Startup checkbox
+        # --- Startup checkbox ---
         self.startup_var = tk.BooleanVar(value=self.config.data['start_on_login'])
         tk.Checkbutton(self.root, text="Start with Windows", variable=self.startup_var,
                        command=self.update_startup).pack(pady=5)
 
-        # Status label
+        # --- Status ---
         self.status_var = tk.StringVar(value="Status: Stopped")
         tk.Label(self.root, textvariable=self.status_var, fg="gray").pack(pady=2)
 
-        # Buttons
+        # --- Monitor buttons ---
         btn_frame = tk.Frame(self.root)
-        btn_frame.pack(pady=8)
-        self.start_btn = tk.Button(btn_frame, text="Start Monitoring", command=self.start_monitoring, width=16)
+        btn_frame.pack(pady=5)
+        self.start_btn = tk.Button(btn_frame, text="Start Monitoring",
+                                   command=self.start_monitoring, width=16)
         self.start_btn.pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Sort Now", command=self.sort_now, width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Sort Now",
+                  command=self.sort_now, width=10).pack(side=tk.LEFT, padx=5)
+
+        # --- Separator ---
+        tk.Frame(self.root, height=1, bg="gray").pack(fill=tk.X, padx=10, pady=6)
+
+        # --- Fresh Organize section ---
+        tk.Label(self.root, text="Fresh Organize (recursive):").pack()
+        fresh_frame = tk.Frame(self.root)
+        fresh_frame.pack(pady=5)
+        self.fresh_dir_var = tk.StringVar(value=self.config.data['monitor_dir'])
+        tk.Entry(fresh_frame, textvariable=self.fresh_dir_var, width=28).pack(side=tk.LEFT, padx=5)
+        tk.Button(fresh_frame, text="Browse",
+                  command=self.choose_fresh_directory).pack(side=tk.LEFT)
+
+        self.fresh_btn = tk.Button(self.root, text="Fresh Organize",
+                                   command=self.fresh_organize, width=16)
+        self.fresh_btn.pack(pady=4)
 
     def _auto_start(self):
-        """Start monitoring automatically on launch if the directory is valid."""
         monitor_dir = self.config.data.get('monitor_dir', '')
         if monitor_dir and os.path.exists(monitor_dir):
             self.start_monitoring(hide=True)
 
     def _hide_to_tray(self):
-        """Hide the main window to the system tray (do not quit)."""
         self.root.withdraw()
         if self.tray_icon is None:
             self.create_tray_icon()
 
     def _update_pending(self, count):
-        """Called when the pending file count changes — refresh tray tooltip."""
         if self.tray_icon:
             suffix = f" ({count} pending)" if count > 0 else ""
             self.tray_icon.title = f"Download Organizer{suffix}"
@@ -357,6 +505,11 @@ class DownloadOrganizerApp:
             self.config.data['monitor_dir'] = directory
             self.config.save()
 
+    def choose_fresh_directory(self):
+        directory = filedialog.askdirectory(initialdir=self.fresh_dir_var.get())
+        if directory:
+            self.fresh_dir_var.set(directory)
+
     def update_startup(self):
         self.config.set_startup(self.startup_var.get())
 
@@ -366,7 +519,7 @@ class DownloadOrganizerApp:
 
     def start_monitoring(self, hide=False):
         if self.observer and self.observer.is_alive():
-            return  # Already running
+            return
 
         monitor_dir = self.dir_var.get()
         if not os.path.exists(monitor_dir):
@@ -405,13 +558,36 @@ class DownloadOrganizerApp:
             for filename in os.listdir(directory):
                 file_path = os.path.join(directory, filename)
                 if os.path.isfile(file_path):
-                    handler.handle_file(file_path)
+                    handler.handle_item(file_path)
 
         messagebox.showinfo("Info", "Files sorted successfully!")
 
+    def fresh_organize(self):
+        target_dir = self.fresh_dir_var.get()
+        if not os.path.exists(target_dir):
+            messagebox.showerror("Error", "Invalid directory selected")
+            return
+
+        self.fresh_btn.config(state=tk.DISABLED, text="Working…")
+
+        def run():
+            try:
+                monitor_dir = self.dir_var.get()
+                organizer = FileOrganizer(monitor_dir)
+                organizer.fresh_organize(target_dir)
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Fresh Organize", "Done! All files organized recursively."))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+            finally:
+                self.root.after(0, lambda: self.fresh_btn.config(
+                    state=tk.NORMAL, text="Fresh Organize"))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def create_tray_icon(self):
         if self.tray_icon is not None:
-            return  # Already created
+            return
 
         def create_icon_image():
             icon_path = os.path.join(os.path.dirname(sys.argv[0]), 'fileorg.ico')
