@@ -831,7 +831,7 @@ class DownloadOrganizerApp:
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Fresh Organize", "Done! All files organized recursively."))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                self.root.after(0, lambda msg=str(e): messagebox.showerror("Error", msg))
             finally:
                 self.root.after(0, lambda: self.fresh_btn.config(
                     state=tk.NORMAL, text="Fresh Organize"))
@@ -869,7 +869,7 @@ class DownloadOrganizerApp:
                     "Remove Duplicates",
                     f"Removed {removed} of {total} duplicate(s)."))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                self.root.after(0, lambda msg=str(e): messagebox.showerror("Error", msg))
             finally:
                 self.root.after(0, lambda: self.dedup_btn.config(
                     state=tk.NORMAL, text="Remove Duplicates"))
