@@ -8,6 +8,7 @@ import sys
 import time
 import json
 import threading
+import ctypes
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import winreg as reg
@@ -18,30 +19,78 @@ import hashlib
 # --- Delay before organizing (in seconds) ---
 ORGANIZE_DELAY = 600  # 10 minutes
 
+# Max retries for file accessibility (10s each = 5 minutes)
+MAX_ACCESS_RETRIES = 30
+
+# Max iterations waiting for .part download (30s each = ~60 minutes)
+MAX_DOWNLOAD_WAIT = 120
+
 # Partial/temp download extensions — never organize these
 SKIP_EXTS = {'crdownload', 'tmp', 'downloading', 'part~'}
 
+# OS-generated junk files — skip silently
+SKIP_FILES = {'desktop.ini', 'thumbs.db', '.ds_store'}
+
+# ---------------------------------------------------------------------------
+# Theme definitions
+# ---------------------------------------------------------------------------
+THEME_DARK = {
+    'bg':              '#1e1e1e',
+    'fg':              '#d4d4d4',
+    'entry_bg':        '#2d2d2d',
+    'entry_fg':        '#d4d4d4',
+    'btn_bg':          '#333333',
+    'btn_fg':          '#d4d4d4',
+    'btn_active_bg':   '#444444',
+    'check_bg':        '#1e1e1e',
+    'check_fg':        '#d4d4d4',
+    'check_select':    '#1e1e1e',
+    'labelframe_fg':   '#888888',
+    'status_fg':       '#808080',
+}
+
+THEME_LIGHT = {
+    'bg':              '#f0f0f0',
+    'fg':              '#000000',
+    'entry_bg':        '#ffffff',
+    'entry_fg':        '#000000',
+    'btn_bg':          '#e1e1e1',
+    'btn_fg':          '#000000',
+    'btn_active_bg':   '#cccccc',
+    'check_bg':        '#f0f0f0',
+    'check_fg':        '#000000',
+    'check_select':    '#f0f0f0',
+    'labelframe_fg':   '#000000',
+    'status_fg':       '#808080',
+}
+
+
+# ---------------------------------------------------------------------------
 # Configuration handler
+# ---------------------------------------------------------------------------
 class Config:
     def __init__(self):
-        self.config_path = os.path.join(os.getenv('APPDATA'), 'DownloadOrganizer', 'config.json')
+        self.config_dir = os.path.join(os.getenv('APPDATA'), 'DownloadOrganizer')
+        self.config_path = os.path.join(self.config_dir, 'config.json')
         self.data = {
             'monitor_dir': os.path.join(os.path.expanduser('~'), 'Downloads'),
-            'start_on_login': False
+            'start_on_login': False,
+            'dark_mode': True,
         }
         self.load()
 
     def load(self):
         try:
             with open(self.config_path, 'r') as f:
-                self.data = json.load(f)
+                saved = json.load(f)
+                self.data.update(saved)
         except (FileNotFoundError, json.JSONDecodeError):
             self.save()
         except Exception as e:
             messagebox.showerror("Error", f"Config load error: {e}")
 
     def save(self):
-        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        os.makedirs(self.config_dir, exist_ok=True)
         with open(self.config_path, 'w') as f:
             json.dump(self.data, f)
 
@@ -65,18 +114,20 @@ class Config:
             messagebox.showerror("Error", f"Startup setting failed: {e}")
 
 
+# ---------------------------------------------------------------------------
 # File organization logic
+# ---------------------------------------------------------------------------
 class FileOrganizer:
     COMPRESSED_EXTS = {'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst'}
 
-    # Directories created by the organizer that fresh_organize should not recurse into
+    # Directories created by the organizer that should not be touched
     SKIP_DIRS = {'Open Archives', 'Archives W. Compressed'}
 
-    # Matches "name (1).ext", "name (2).ext", etc. produced by the organizer or browser
+    # Matches "name (1).ext", "name (2).ext", etc.
     COPY_PATTERN = re.compile(r'^(.+?)\s*\((\d+)\)(\.[^.]+)$')
 
-    # Nested structure: category → sub-type → [extensions]
-    # Flat entries (list value) have no sub-type folder.
+    # Category -> sub-type -> [extensions]
+    # Flat entries (list) have no sub-type folder.
     CATEGORIES = {
         'Images': {
             'Photos':   ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tiff', 'raw', 'heic', 'heif'],
@@ -136,37 +187,57 @@ class FileOrganizer:
             'Libraries': ['dll', 'so', 'dylib'],
             'Compiled':  ['pyd', 'pyo', 'pyc', 'bin'],
         },
-        'Others': [],   # catch-all — no sub-type
+        'Others': [],   # catch-all
     }
+
+    # Pre-built lookup tables (populated once, used for every file)
+    _EXT_MAP = None       # ext -> (category, sub_category)
+    _KNOWN_DIRS = None    # set of all folder names the organizer creates
+
+    @classmethod
+    def _get_ext_map(cls):
+        if cls._EXT_MAP is None:
+            m = {}
+            for cat, value in cls.CATEGORIES.items():
+                if isinstance(value, dict):
+                    for sub, exts in value.items():
+                        for e in exts:
+                            m[e] = (cat, sub)
+                elif isinstance(value, list):
+                    for e in value:
+                        m[e] = (cat, None)
+            cls._EXT_MAP = m
+        return cls._EXT_MAP
+
+    @classmethod
+    def _get_known_dirs(cls):
+        """All directory names the organizer creates — never move these."""
+        if cls._KNOWN_DIRS is None:
+            dirs = set(cls.CATEGORIES.keys()) | cls.SKIP_DIRS
+            for value in cls.CATEGORIES.values():
+                if isinstance(value, dict):
+                    dirs.update(value.keys())
+            cls._KNOWN_DIRS = dirs
+        return cls._KNOWN_DIRS
 
     def __init__(self, base_path):
         self.base_path = base_path
-        self._lock = threading.Lock()  # guards paired archive moves
+        self._lock = threading.Lock()
 
     def get_category(self, filename):
-        """Return (category, sub_category) or (category, None) for flat entries."""
+        """Return (category, sub_category) or ('Others', None)."""
         ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-        for category, value in self.CATEGORIES.items():
-            if isinstance(value, dict):
-                for sub_category, exts in value.items():
-                    if ext in exts:
-                        return (category, sub_category)
-            elif isinstance(value, list):
-                if ext in value:
-                    return (category, None)
-        return ('Others', None)
+        return self._get_ext_map().get(ext, ('Others', None))
 
     def _dest_dir(self, category, sub_category):
-        """Build the full destination directory path by format only."""
         if category == 'Others':
             return os.path.join(self.base_path, 'Others')
         if sub_category:
             return os.path.join(self.base_path, category, sub_category)
-        else:
-            return os.path.join(self.base_path, category)
+        return os.path.join(self.base_path, category)
 
     def _unique_dest(self, parent, name):
-        """Return a collision-free path for name inside parent."""
+        """Return a collision-free path for *name* inside *parent*."""
         dest = os.path.join(parent, name)
         if not os.path.exists(dest):
             return dest
@@ -179,7 +250,6 @@ class FileOrganizer:
             counter += 1
 
     def _find_paired_archive(self, parent_dir, dirname):
-        """Return the path of a compressed file matching dirname, or None."""
         for ext in self.COMPRESSED_EXTS:
             candidate = os.path.join(parent_dir, f"{dirname}.{ext}")
             if os.path.exists(candidate):
@@ -205,8 +275,20 @@ class FileOrganizer:
             if not os.path.exists(dir_path):
                 return
             dirname = os.path.basename(dir_path)
-            parent  = os.path.dirname(dir_path)
-            paired  = self._find_paired_archive(parent, dirname)
+
+            # Never move known category / sub-category / archive folders
+            if dirname in self._get_known_dirs():
+                return
+
+            # Skip empty directories
+            try:
+                if not any(os.scandir(dir_path)):
+                    return
+            except PermissionError:
+                return
+
+            parent = os.path.dirname(dir_path)
+            paired = self._find_paired_archive(parent, dirname)
 
             if paired and os.path.exists(paired):
                 dest_parent = os.path.join(self.base_path, 'Archives W. Compressed')
@@ -216,14 +298,14 @@ class FileOrganizer:
                 shutil.move(paired, os.path.join(dest, os.path.basename(paired)))
                 logging.info(
                     f"Paired '{dirname}' + '{os.path.basename(paired)}'"
-                    f" → Archives W. Compressed"
+                    f" -> Archives W. Compressed"
                 )
             else:
                 dest_parent = os.path.join(self.base_path, 'Open Archives')
                 os.makedirs(dest_parent, exist_ok=True)
                 dest = self._unique_dest(dest_parent, dirname)
                 shutil.move(dir_path, dest)
-                logging.info(f"'{dirname}' → Open Archives")
+                logging.info(f"'{dirname}' -> Open Archives")
 
     # ------------------------------------------------------------------
     # File handling
@@ -234,29 +316,33 @@ class FileOrganizer:
             self._organize_dir(file_path)
             return
 
-        ext = file_path.rsplit('.', 1)[-1].lower() if '.' in file_path else ''
+        filename = os.path.basename(file_path)
 
-        # Skip partial/temp downloads completely
+        # Skip OS junk and temp downloads
+        if filename.lower() in SKIP_FILES:
+            return
+        ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
         if ext in SKIP_EXTS:
             return
 
-        # Wait for the file to be accessible (not still being written)
-        while True:
+        # Wait for the file to be accessible (max ~5 min)
+        for _ in range(MAX_ACCESS_RETRIES):
             try:
                 with open(file_path, 'rb') as f:
                     f.read(8)
                 break
             except (IOError, OSError):
                 time.sleep(10)
+        else:
+            logging.warning(f"File inaccessible after retries: '{filename}'")
+            return
 
-        filename = os.path.basename(file_path)
-        self.wait_for_download_completion(file_path)
+        self._wait_for_download(file_path)
 
         if not os.path.exists(file_path):
             return
 
-        # If this is a compressed file and a matching directory exists,
-        # let _organize_dir handle both together
+        # Compressed file with a matching directory -> pair them
         if ext in self.COMPRESSED_EXTS:
             stem = filename[:-(len(ext) + 1)]
             candidate_dir = os.path.join(os.path.dirname(file_path), stem)
@@ -265,19 +351,19 @@ class FileOrganizer:
                 return
 
         category, sub_category = self.get_category(filename)
-        dest_dir  = self._dest_dir(category, sub_category)
-        dest_path = os.path.join(dest_dir, filename)
+        dest_dir = self._dest_dir(category, sub_category)
 
-        # Already in the right place — nothing to do
+        # Already in the right place
         if os.path.abspath(os.path.dirname(file_path)) == os.path.abspath(dest_dir):
             return
 
         os.makedirs(dest_dir, exist_ok=True)
+        dest_path = os.path.join(dest_dir, filename)
         label = f"{category}/{sub_category}" if sub_category else category
 
         if not os.path.exists(dest_path):
             shutil.move(file_path, dest_dir)
-            logging.info(f"Moved '{filename}' → {label}")
+            logging.info(f"Moved '{filename}' -> {label}")
         else:
             base, extension = os.path.splitext(filename)
             counter = 1
@@ -286,31 +372,24 @@ class FileOrganizer:
                 new_path = os.path.join(dest_dir, new_name)
                 if not os.path.exists(new_path):
                     shutil.move(file_path, new_path)
-                    logging.info(f"Moved '{filename}' → {label} as '{new_name}'")
+                    logging.info(f"Moved '{filename}' -> {label} as '{new_name}'")
                     break
                 counter += 1
 
-    def wait_for_download_completion(self, file_path, check_interval=30):
-        base_file_path = file_path[:-5] if file_path.lower().endswith('.part') else file_path
-
-        while True:
-            if file_path.lower().endswith('.part'):
-                if not os.path.exists(file_path):
-                    if os.path.exists(base_file_path):
-                        logging.info(f"Download completed: '{base_file_path}' is available.")
-                        break
-                    else:
-                        logging.warning(f"File '{file_path}' was removed or renamed unexpectedly.")
-                        break
+    def _wait_for_download(self, file_path, interval=30):
+        """Block until a .part file finishes downloading (with timeout)."""
+        if not file_path.lower().endswith('.part'):
+            return
+        base_path = file_path[:-5]
+        for _ in range(MAX_DOWNLOAD_WAIT):
+            if not os.path.exists(file_path):
+                if os.path.exists(base_path):
+                    logging.info(f"Download completed: '{os.path.basename(base_path)}'")
                 else:
-                    logging.info(f"Download still in progress: '{file_path}'")
-            else:
-                if os.path.exists(file_path):
-                    break
-                else:
-                    logging.warning(f"File '{file_path}' does not exist.")
-                    break
-            time.sleep(check_interval)
+                    logging.warning(f"'{os.path.basename(file_path)}' removed unexpectedly.")
+                return
+            time.sleep(interval)
+        logging.warning(f"Download wait timed out: '{os.path.basename(file_path)}'")
 
     # ------------------------------------------------------------------
     # Fresh / recursive organize
@@ -319,23 +398,22 @@ class FileOrganizer:
     def fresh_organize(self, root_dir):
         """Recursively organize all files and dirs under root_dir.
 
-        - Skips Open Archives and Archives W. Compressed (to avoid a mess).
-        - Skips hidden files/dirs (names starting with '.').
-        - Recurses into known category folders; moves unknown dirs to
-          Open Archives or Archives W. Compressed.
-        - Files already in the correct folder are left untouched.
+        Skips Open Archives, Archives W. Compressed, hidden items,
+        and known category/sub-category folders (recurses into them instead).
         """
         try:
             entries = list(os.scandir(root_dir))
         except PermissionError:
             return
 
-        # Organize loose files at this level first
+        known = self._get_known_dirs()
+
+        # Files first
         for entry in entries:
             if entry.is_file(follow_symlinks=False) and not entry.name.startswith('.'):
                 self.organize_file(entry.path)
 
-        # Then handle subdirectories
+        # Directories
         for entry in entries:
             if not entry.is_dir(follow_symlinks=False):
                 continue
@@ -344,13 +422,11 @@ class FileOrganizer:
             if entry.name in self.SKIP_DIRS:
                 continue
             if not os.path.exists(entry.path):
-                continue  # already moved (e.g. paired archive handled it)
+                continue
 
-            if entry.name in self.CATEGORIES:
-                # Known category folder — recurse into it, don't move it
+            if entry.name in known:
                 self.fresh_organize(entry.path)
             else:
-                # Unknown directory — treat as Open Archive / Archives W. Compressed
                 self._organize_dir(entry.path)
 
     # ------------------------------------------------------------------
@@ -360,15 +436,10 @@ class FileOrganizer:
     def find_duplicates(self, root_dir):
         """Recursively find duplicate files.
 
-        A file is considered a duplicate when:
-          1. Its name matches the copy pattern  name (N).ext
-          2. A file with the original name exists in the same directory
-          3. Both files have the same size
-          4. Both files have the same partial hash (first + last 8 KB)
-
-        Returns a list of paths safe to remove.
+        A file is a duplicate when its name matches the copy pattern
+        ``name (N).ext``, a same-name original exists in the same dir,
+        and both share the same size and partial content hash.
         """
-        # Group files by (directory, base_name, extension)
         groups = {}  # (dir, base, ext) -> [(path, size, is_copy)]
 
         for dirpath, dirnames, filenames in os.walk(root_dir):
@@ -398,7 +469,6 @@ class FileOrganizer:
             if len(files) < 2:
                 continue
 
-            # Sub-group by size — only same-size files can be duplicates
             by_size = {}
             for fpath, size, is_copy in files:
                 by_size.setdefault(size, []).append((fpath, is_copy))
@@ -407,7 +477,6 @@ class FileOrganizer:
                 if len(same_size) < 2:
                     continue
 
-                # Verify with partial hash
                 by_hash = {}
                 for fpath, is_copy in same_size:
                     h = self._file_hash(fpath)
@@ -422,10 +491,8 @@ class FileOrganizer:
                     copies    = [f for f in confirmed if f[1]]
 
                     if originals:
-                        # Original exists — remove all numbered copies
                         to_remove.extend(f[0] for f in copies)
                     else:
-                        # All are copies (original renamed?) — keep lowest number
                         copies.sort(key=lambda f: f[0])
                         to_remove.extend(f[0] for f in copies[1:])
 
@@ -433,7 +500,7 @@ class FileOrganizer:
 
     @staticmethod
     def _file_hash(path, chunk_size=8192):
-        """Quick hash using the first and last 8 KB of the file."""
+        """Quick hash: first + last 8 KB."""
         h = hashlib.md5()
         try:
             size = os.path.getsize(path)
@@ -447,7 +514,7 @@ class FileOrganizer:
         return h.hexdigest()
 
     def remove_duplicates(self, root_dir):
-        """Find and delete duplicate files. Returns (removed_count, total_found)."""
+        """Find and delete duplicate files. Returns (removed, total)."""
         to_remove = self.find_duplicates(root_dir)
         removed = 0
         for path in to_remove:
@@ -460,14 +527,16 @@ class FileOrganizer:
         return removed, len(to_remove)
 
 
-# File system event handler — with 10-minute delay
+# ---------------------------------------------------------------------------
+# File system event handler (with configurable delay)
+# ---------------------------------------------------------------------------
 class DownloadHandler(FileSystemEventHandler):
     def __init__(self, organizer, on_pending_change=None):
         super().__init__()
         self.organizer = organizer
         self.retries = 5
         self.delay = 2
-        self._pending_timers = {}   # path -> threading.Timer
+        self._pending_timers = {}
         self._lock = threading.Lock()
         self.on_pending_change = on_pending_change
 
@@ -477,15 +546,12 @@ class DownloadHandler(FileSystemEventHandler):
             return len(self._pending_timers)
 
     def on_created(self, event):
-        # Handle both new files and new directories
         self._schedule(event.src_path)
 
     def _schedule(self, path):
-        """Schedule a path (file or dir) to be organized after ORGANIZE_DELAY seconds."""
         with self._lock:
             if path in self._pending_timers:
                 self._pending_timers[path].cancel()
-
             timer = threading.Timer(ORGANIZE_DELAY, self._run, args=[path])
             self._pending_timers[path] = timer
             timer.start()
@@ -493,22 +559,17 @@ class DownloadHandler(FileSystemEventHandler):
                 f"Queued '{os.path.basename(path)}' — will organize in "
                 f"{ORGANIZE_DELAY // 60} min ({self.pending_count} pending)"
             )
-
         if self.on_pending_change:
             self.on_pending_change(self.pending_count)
 
     def _run(self, path):
-        """Called after the delay; actually organizes the item."""
         with self._lock:
             self._pending_timers.pop(path, None)
-
         if self.on_pending_change:
             self.on_pending_change(self.pending_count)
-
         if not os.path.exists(path):
             logging.info(f"Item no longer exists, skipping: '{path}'")
             return
-
         self.handle_item(path)
 
     def handle_item(self, path):
@@ -528,32 +589,90 @@ class DownloadHandler(FileSystemEventHandler):
                 break
 
     def cancel_all(self):
-        """Cancel all pending timers (called on shutdown)."""
         with self._lock:
             for timer in self._pending_timers.values():
                 timer.cancel()
             self._pending_timers.clear()
 
 
-# Main application class
+# ---------------------------------------------------------------------------
+# GUI application
+# ---------------------------------------------------------------------------
 class DownloadOrganizerApp:
     def __init__(self):
         self.config = Config()
         self.observer = None
         self.handler = None
         self.tray_icon = None
+        self._theme = None
         self.setup_gui()
+        self._apply_theme(THEME_DARK if self.config.data.get('dark_mode', True) else THEME_LIGHT)
+        self._set_dark_title_bar(self.config.data.get('dark_mode', True))
         self._auto_start()
+
+    # ── Theme ──────────────────────────────────────────────────────
+
+    def _apply_theme(self, theme):
+        self._theme = theme
+        self.root.configure(bg=theme['bg'])
+        self._apply_to_children(self.root, theme)
+
+    def _apply_to_children(self, widget, theme):
+        for child in widget.winfo_children():
+            cls = child.winfo_class()
+            try:
+                if cls in ('Frame', 'Toplevel'):
+                    child.configure(bg=theme['bg'])
+                elif cls == 'Label':
+                    fg = theme['status_fg'] if child is self._status_label else theme['fg']
+                    child.configure(bg=theme['bg'], fg=fg)
+                elif cls == 'Entry':
+                    child.configure(bg=theme['entry_bg'], fg=theme['entry_fg'],
+                                    insertbackground=theme['entry_fg'],
+                                    disabledbackground=theme['entry_bg'])
+                elif cls == 'Button':
+                    child.configure(bg=theme['btn_bg'], fg=theme['btn_fg'],
+                                    activebackground=theme['btn_active_bg'],
+                                    activeforeground=theme['btn_fg'])
+                elif cls == 'Checkbutton':
+                    child.configure(bg=theme['check_bg'], fg=theme['check_fg'],
+                                    selectcolor=theme['check_select'],
+                                    activebackground=theme['check_bg'],
+                                    activeforeground=theme['check_fg'])
+                elif cls == 'Labelframe':
+                    child.configure(bg=theme['bg'], fg=theme['labelframe_fg'])
+            except tk.TclError:
+                pass
+            self._apply_to_children(child, theme)
+
+    def _set_dark_title_bar(self, dark=True):
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                ctypes.byref(ctypes.c_int(1 if dark else 0)),
+                ctypes.sizeof(ctypes.c_int))
+        except Exception:
+            pass
+
+    def _toggle_dark_mode(self):
+        dark = self.dark_var.get()
+        self.config.data['dark_mode'] = dark
+        self.config.save()
+        self._apply_theme(THEME_DARK if dark else THEME_LIGHT)
+        self._set_dark_title_bar(dark)
+
+    # ── GUI setup ──────────────────────────────────────────────────
 
     def setup_gui(self):
         self.root = tk.Tk()
         self.root.title("Download Organizer")
-        self.root.geometry("420x390")
+        self.root.geometry("420x410")
         self.root.resizable(False, False)
-
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
 
-        # ── Monitoring ─────────────────────────────────────────────
+        # ── Monitoring ─────────────────────────────────────────
         monitor_frame = tk.LabelFrame(self.root, text="Monitoring", padx=8, pady=6)
         monitor_frame.pack(fill=tk.X, padx=10, pady=(8, 4))
 
@@ -563,13 +682,20 @@ class DownloadOrganizerApp:
         tk.Entry(dir_row, textvariable=self.dir_var, width=35).pack(side=tk.LEFT, padx=(0, 5))
         tk.Button(dir_row, text="Browse", command=self.choose_directory).pack(side=tk.LEFT)
 
-        self.startup_var = tk.BooleanVar(value=self.config.data['start_on_login'])
-        tk.Checkbutton(monitor_frame, text="Start with Windows",
+        opts_row = tk.Frame(monitor_frame)
+        opts_row.pack(fill=tk.X, pady=2)
+        self.startup_var = tk.BooleanVar(value=self.config.data.get('start_on_login', False))
+        tk.Checkbutton(opts_row, text="Start with Windows",
                        variable=self.startup_var,
-                       command=self.update_startup).pack(anchor=tk.W, pady=2)
+                       command=self.update_startup).pack(side=tk.LEFT)
+        self.dark_var = tk.BooleanVar(value=self.config.data.get('dark_mode', True))
+        tk.Checkbutton(opts_row, text="Dark Mode",
+                       variable=self.dark_var,
+                       command=self._toggle_dark_mode).pack(side=tk.LEFT, padx=(12, 0))
 
         self.status_var = tk.StringVar(value="Status: Stopped")
-        tk.Label(monitor_frame, textvariable=self.status_var, fg="gray").pack(anchor=tk.W)
+        self._status_label = tk.Label(monitor_frame, textvariable=self.status_var)
+        self._status_label.pack(anchor=tk.W)
 
         btn_row = tk.Frame(monitor_frame)
         btn_row.pack(fill=tk.X, pady=(4, 0))
@@ -579,7 +705,7 @@ class DownloadOrganizerApp:
         tk.Button(btn_row, text="Sort Now",
                   command=self.sort_now, width=10).pack(side=tk.LEFT)
 
-        # ── Tools ──────────────────────────────────────────────────
+        # ── Tools ──────────────────────────────────────────────
         tools_frame = tk.LabelFrame(self.root, text="Tools", padx=8, pady=6)
         tools_frame.pack(fill=tk.X, padx=10, pady=4)
 
@@ -600,6 +726,8 @@ class DownloadOrganizerApp:
                                    command=self.remove_duplicates, width=18)
         self.dedup_btn.pack(side=tk.LEFT)
 
+    # ── Lifecycle ──────────────────────────────────────────────
+
     def _auto_start(self):
         monitor_dir = self.config.data.get('monitor_dir', '')
         if monitor_dir and os.path.exists(monitor_dir):
@@ -614,6 +742,8 @@ class DownloadOrganizerApp:
         if self.tray_icon:
             suffix = f" ({count} pending)" if count > 0 else ""
             self.tray_icon.title = f"Download Organizer{suffix}"
+
+    # ── Directory pickers ──────────────────────────────────────
 
     def choose_directory(self):
         directory = filedialog.askdirectory(initialdir=self.dir_var.get())
@@ -634,6 +764,8 @@ class DownloadOrganizerApp:
         self.root.deiconify()
         self.root.lift()
 
+    # ── Monitoring ─────────────────────────────────────────────
+
     def start_monitoring(self, hide=False):
         if self.observer and self.observer.is_alive():
             return
@@ -649,7 +781,7 @@ class DownloadOrganizerApp:
         self.observer.schedule(self.handler, monitor_dir, recursive=False)
         self.observer.start()
 
-        self.status_var.set(f"Status: Monitoring  •  {ORGANIZE_DELAY // 60}-min delay active")
+        self.status_var.set(f"Status: Monitoring  \u2022  {ORGANIZE_DELAY // 60}-min delay active")
         self.start_btn.config(state=tk.DISABLED)
         logging.info(f"Started monitoring: {monitor_dir}")
 
@@ -673,13 +805,13 @@ class DownloadOrganizerApp:
 
         for directory in dirs_to_scan:
             for entry_name in os.listdir(directory):
-                entry_path = os.path.join(directory, entry_name)
-                handler.handle_item(entry_path)
+                handler.handle_item(os.path.join(directory, entry_name))
 
         messagebox.showinfo("Info", "Files sorted successfully!")
 
+    # ── Tools ──────────────────────────────────────────────────
+
     def _tools_target(self):
-        """Validate and return the tools target directory."""
         target = self.tools_dir_var.get()
         if not os.path.exists(target):
             messagebox.showerror("Error", "Invalid target directory")
@@ -690,13 +822,11 @@ class DownloadOrganizerApp:
         target_dir = self._tools_target()
         if not target_dir:
             return
-
         self.fresh_btn.config(state=tk.DISABLED, text="Working...")
 
         def run():
             try:
-                monitor_dir = self.dir_var.get()
-                organizer = FileOrganizer(monitor_dir)
+                organizer = FileOrganizer(self.dir_var.get())
                 organizer.fresh_organize(target_dir)
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Fresh Organize", "Done! All files organized recursively."))
@@ -713,24 +843,21 @@ class DownloadOrganizerApp:
         if not target_dir:
             return
 
-        # Preview first — show what would be removed
-        monitor_dir = self.dir_var.get()
-        organizer = FileOrganizer(monitor_dir)
+        organizer = FileOrganizer(self.dir_var.get())
         to_remove = organizer.find_duplicates(target_dir)
 
         if not to_remove:
             messagebox.showinfo("Remove Duplicates", "No duplicates found.")
             return
 
-        # Build a readable preview (show up to 20 files)
-        preview_lines = [f"{len(to_remove)} duplicate(s) found:\n"]
+        preview = [f"{len(to_remove)} duplicate(s) found:\n"]
         for path in to_remove[:20]:
-            preview_lines.append(f"  {os.path.relpath(path, target_dir)}")
+            preview.append(f"  {os.path.relpath(path, target_dir)}")
         if len(to_remove) > 20:
-            preview_lines.append(f"  ... and {len(to_remove) - 20} more")
-        preview_lines.append("\nDelete these files?")
+            preview.append(f"  ... and {len(to_remove) - 20} more")
+        preview.append("\nDelete these files?")
 
-        if not messagebox.askyesno("Remove Duplicates", "\n".join(preview_lines)):
+        if not messagebox.askyesno("Remove Duplicates", "\n".join(preview)):
             return
 
         self.dedup_btn.config(state=tk.DISABLED, text="Working...")
@@ -749,6 +876,8 @@ class DownloadOrganizerApp:
 
         threading.Thread(target=run, daemon=True).start()
 
+    # ── System tray ────────────────────────────────────────────
+
     def create_tray_icon(self):
         if self.tray_icon is not None:
             return
@@ -757,10 +886,13 @@ class DownloadOrganizerApp:
             icon_path = os.path.join(os.path.dirname(sys.argv[0]), 'fileorg.ico')
             if os.path.exists(icon_path):
                 return Image.open(icon_path)
-            image = Image.new('RGB', (64, 64), color=(0, 0, 0))
-            draw = ImageDraw.Draw(image)
-            draw.rectangle((0, 0, 64, 64), fill=(30, 120, 200))
-            return image
+            img = Image.new('RGB', (64, 64), color=(30, 120, 200))
+            draw = ImageDraw.Draw(img)
+            draw.rectangle((16, 12, 48, 52), fill=(255, 255, 255))
+            draw.rectangle((20, 20, 44, 24), fill=(30, 120, 200))
+            draw.rectangle((20, 30, 44, 34), fill=(30, 120, 200))
+            draw.rectangle((20, 40, 44, 44), fill=(30, 120, 200))
+            return img
 
         menu = pystray.Menu(
             pystray.MenuItem('Sort Now', self.sort_now),
@@ -787,12 +919,18 @@ class DownloadOrganizerApp:
         sys.exit(0)
 
 
+# ---------------------------------------------------------------------------
+# Logging — write to a stable location alongside the config
+# ---------------------------------------------------------------------------
+_log_dir = os.path.join(os.getenv('APPDATA'), 'DownloadOrganizer')
+os.makedirs(_log_dir, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
-    filename='app.log',
-    filemode='a'   # append so logs survive restarts
+    filename=os.path.join(_log_dir, 'app.log'),
+    filemode='a',
 )
 logger = logging.getLogger(__name__)
 logger.info('=== Download Organizer started ===')
