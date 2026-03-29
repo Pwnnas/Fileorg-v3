@@ -11,7 +11,6 @@ import threading
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import winreg as reg
-import logging
 
 # --- Delay before organizing (in seconds) ---
 ORGANIZE_DELAY = 600  # 10 minutes
@@ -176,11 +175,8 @@ class FileOrganizer:
         os.makedirs(dest_dir, exist_ok=True)
         dest_path = os.path.join(dest_dir, filename)
 
-        label = f"{category}/{sub_category}" if sub_category else category
-
         if not os.path.exists(dest_path):
             shutil.move(file_path, dest_dir)
-            logging.info(f"Moved '{filename}' → {label}")
         else:
             base, extension = os.path.splitext(filename)
             counter = 1
@@ -189,7 +185,6 @@ class FileOrganizer:
                 new_path = os.path.join(dest_dir, new_name)
                 if not os.path.exists(new_path):
                     shutil.move(file_path, new_path)
-                    logging.info(f"Moved '{filename}' → {label} as '{new_name}'")
                     break
                 counter += 1
 
@@ -199,20 +194,10 @@ class FileOrganizer:
         while True:
             if file_path.lower().endswith('.part'):
                 if not os.path.exists(file_path):
-                    if os.path.exists(base_file_path):
-                        logging.info(f"Download completed: '{base_file_path}' is available.")
-                        break
-                    else:
-                        logging.warning(f"File '{file_path}' was removed or renamed unexpectedly.")
-                        break
-                else:
-                    logging.info(f"Download still in progress: '{file_path}'")
+                    break
+                # still downloading — wait and check again
             else:
-                if os.path.exists(file_path):
-                    break
-                else:
-                    logging.warning(f"File '{file_path}' does not exist.")
-                    break
+                break
             time.sleep(check_interval)
 
 
@@ -246,10 +231,6 @@ class DownloadHandler(FileSystemEventHandler):
             timer = threading.Timer(ORGANIZE_DELAY, self._run, args=[path])
             self._pending_timers[path] = timer
             timer.start()
-            logging.info(
-                f"Queued '{os.path.basename(path)}' — will organize in "
-                f"{ORGANIZE_DELAY // 60} min ({self.pending_count} pending)"
-            )
 
         if self.on_pending_change:
             self.on_pending_change(self.pending_count)
@@ -263,7 +244,6 @@ class DownloadHandler(FileSystemEventHandler):
             self.on_pending_change(self.pending_count)
 
         if not os.path.exists(path):
-            logging.info(f"File no longer exists, skipping: '{path}'")
             return
 
         self.handle_file(path)
@@ -277,8 +257,7 @@ class DownloadHandler(FileSystemEventHandler):
                 break
             except PermissionError:
                 time.sleep(self.delay)
-            except Exception as e:
-                logging.error(f"Error processing {path}: {e}")
+            except Exception:
                 break
 
     def cancel_all(self):
@@ -381,7 +360,6 @@ class DownloadOrganizerApp:
 
         self.status_var.set(f"Status: Monitoring  •  {ORGANIZE_DELAY // 60}-min delay active")
         self.start_btn.config(state=tk.DISABLED)
-        logging.info(f"Started monitoring: {monitor_dir}")
 
         if hide:
             self.root.withdraw()
@@ -446,16 +424,6 @@ class DownloadOrganizerApp:
         self.root.destroy()
         sys.exit(0)
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    filename='app.log',
-    filemode='a'   # append so logs survive restarts
-)
-logger = logging.getLogger(__name__)
-logger.info('=== Download Organizer started ===')
 
 if __name__ == "__main__":
     app = DownloadOrganizerApp()
